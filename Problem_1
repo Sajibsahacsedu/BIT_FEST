@@ -1,1 +1,164 @@
+# Install required packages
+!pip install transformers datasets sacrebleu sentencepiece torch
 
+import torch
+from datasets import load_dataset
+from transformers import (
+    MBartForConditionalGeneration,
+    MBartTokenizer,
+    Seq2SeqTrainingArguments,
+    Seq2SeqTrainer,
+    DataCollatorForSeq2Seq
+)
+from sklearn.model_selection import train_test_split
+import numpy as np
+import pandas as pd
+
+# Check if GPU is available
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Load dataset
+dataset = load_dataset("SKNahin/bengali-transliteration-data")
+
+# Convert dataset to pandas DataFrame for easier manipulation
+df = pd.DataFrame(dataset['train'])
+print(f"Total samples in dataset: {len(df)}")
+
+# Clean the data by removing any empty rows
+df = df.dropna()
+df = df[df['bn'].str.strip().str.len() > 0]
+df = df[df['rm'].str.strip().str.len() > 0]
+print(f"Samples after cleaning: {len(df)}")
+
+# Split the dataset
+train_df, val_df = train_test_split(df, test_size=0.1, random_state=42)
+print(f"Training samples: {len(train_df)}")
+print(f"Validation samples: {len(val_df)}")
+
+# Initialize tokenizer and model
+model_name = "facebook/mbart-large-cc25"
+tokenizer = MBartTokenizer.from_pretrained(model_name)
+model = MBartForConditionalGeneration.from_pretrained(model_name)
+model = model.to(device)
+
+# Set source and target language
+tokenizer.src_lang = "en_XX"
+tokenizer.tgt_lang = "bn_IN"
+
+# Data preprocessing function
+def preprocess_data(examples):
+    # Tokenize Banglish (source) text
+    source_encoding = tokenizer(
+        examples['rm'].tolist(),
+        max_length=128,
+        padding='max_length',
+        truncation=True,
+        return_tensors="pt"
+    )
+    
+    # Tokenize Bengali (target) text
+    target_encoding = tokenizer(
+        examples['bn'].tolist(),
+        max_length=128,
+        padding='max_length',
+        truncation=True,
+        return_tensors="pt"
+    )
+
+    return {
+        'input_ids': source_encoding['input_ids'],
+        'attention_mask': source_encoding['attention_mask'],
+        'labels': target_encoding['input_ids']
+    }
+
+# Convert datasets to torch format
+class TransliterationDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings):
+        self.encodings = encodings
+
+    def __getitem__(self, idx):
+        return {key: val[idx].clone().detach() for key, val in self.encodings.items()}
+
+    def __len__(self):
+        return len(self.encodings['input_ids'])
+
+# Preprocess train and validation sets
+train_encodings = preprocess_data(train_df)
+val_encodings = preprocess_data(val_df)
+
+train_dataset = TransliterationDataset(train_encodings)
+val_dataset = TransliterationDataset(val_encodings)
+
+# Training arguments
+training_args = Seq2SeqTrainingArguments(
+    output_dir="./results",
+    evaluation_strategy="steps",
+    eval_steps=500,
+    learning_rate=2e-5,
+    per_device_train_batch_size=8,
+    per_device_eval_batch_size=8,
+    num_train_epochs=1,  # Reduced to 1 epoch
+    weight_decay=0.01,
+    save_total_limit=3,
+    predict_with_generate=True,
+    fp16=True,
+    push_to_hub=False,
+    logging_steps=100,
+    save_steps=500,
+    report_to="none"
+)
+
+# Initialize data collator
+data_collator = DataCollatorForSeq2Seq(
+    tokenizer=tokenizer,
+    model=model,
+    padding=True
+)
+
+# Initialize trainer
+trainer = Seq2SeqTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    data_collator=data_collator,
+)
+
+# Train the model
+trainer.train()
+
+# Save the model
+model.save_pretrained("banglish_bengali_translator")
+tokenizer.save_pretrained("banglish_bengali_translator")
+
+# Function to translate Banglish to Bengali
+def translate_banglish_to_bengali(text):
+    # Move inputs to the same device as model
+    inputs = tokenizer(text, return_tensors="pt", padding=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    translated_tokens = model.generate(
+        **inputs,
+        max_length=128,
+        num_beams=5,
+        length_penalty=1.0,
+        early_stopping=True
+    )
+    return tokenizer.decode(translated_tokens[0], skip_special_tokens=True)
+
+# Test the model with a few examples
+test_examples = [
+    "ami tomake bhalobashi",
+    "bangladesh amar desh",
+    "kemon acho"
+]
+
+print("\nTesting the model with example phrases:")
+for text in test_examples:
+    try:
+        bengali = translate_banglish_to_bengali(text)
+        print(f"Banglish: {text}")
+        print(f"Bengali: {bengali}\n")
+    except Exception as e:
+        print(f"Error processing '{text}': {str(e)}\n")
