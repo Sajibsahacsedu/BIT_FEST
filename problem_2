@@ -1,0 +1,223 @@
+
+# First, create and run this cell to install requirements
+!pip install fastapi uvicorn sqlalchemy python-multipart python-dotenv openai pytesseract Pillow nest-asyncio pyngrok
+
+# Next, run this cell to setup ngrok
+!curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null && echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list && sudo apt update && sudo apt install ngrok
+
+# Then run this cell to set up ngrok authentication
+NGROK_AUTH_TOKEN = "2qWsBkmZxpl2knobM1OksYvBXbC_7ccsPNiJMMgpARjPWhYig"  # Replace with your token
+!ngrok authtoken $NGROK_AUTH_TOKEN
+
+# Now run this cell for the main implementation
+import nest_asyncio
+from pyngrok import ngrok
+import uvicorn
+import json
+import os
+from fastapi import FastAPI, HTTPException, Depends
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, JSON
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.sql import func
+from typing import List, Dict
+from pydantic import BaseModel
+from datetime import datetime
+import openai
+from pathlib import Path
+
+# Enable nested asyncio for Colab
+nest_asyncio.apply()
+
+# Set OpenAI API key
+OPENAI_API_KEY = "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"  # Replace with your key
+openai.api_key = OPENAI_API_KEY
+
+# Create a new directory for our project
+!mkdir -p kitchen_buddy
+%cd kitchen_buddy
+
+# Initialize FastAPI app
+app = FastAPI(title="Mofa's Kitchen Buddy")
+
+# Database setup
+SQLALCHEMY_DATABASE_URL = "sqlite:///./kitchen_buddy.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Models
+class Ingredient(Base):
+    tablename = "ingredients"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True)
+    quantity = Column(Float)
+    unit = Column(String)
+    category = Column(String)
+    expiry_date = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+class Recipe(Base):
+    tablename = "recipes"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True)
+    ingredients = Column(JSON)
+    instructions = Column(Text)
+    cuisine_type = Column(String)
+    preparation_time = Column(Integer)
+    taste_profile = Column(JSON)
+    reviews = Column(Float)
+    source = Column(String)
+
+# Create database tables
+Base.metadata.create_all(bind=engine)
+
+# Pydantic models
+class IngredientCreate(BaseModel):
+    name: str
+    quantity: float
+    unit: str
+    category: str
+    expiry_date: datetime = None
+
+class RecipeCreate(BaseModel):
+    name: str
+    ingredients: List[str]
+    instructions: str
+    cuisine_type: str
+    preparation_time: int
+    taste_profile: Dict
+    reviews: float = 0.0
+    source: str = ""
+
+# Database dependency
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# API Routes
+@app.post("/ingredients/")
+async def create_ingredient(ingredient: IngredientCreate, db: Session = Depends(get_db)):
+    db_ingredient = Ingredient(**ingredient.dict())
+    db.add(db_ingredient)
+    db.commit()
+    db.refresh(db_ingredient)
+    return db_ingredient
+
+@app.get("/ingredients/")
+async def get_ingredients(db: Session = Depends(get_db)):
+    return db.query(Ingredient).all()
+
+@app.post("/recipes/")
+async def create_recipe(recipe: RecipeCreate, db: Session = Depends(get_db)):
+    db_recipe = Recipe(**recipe.dict())
+    db.add(db_recipe)
+    db.commit()
+    db.refresh(db_recipe)
+    return db_recipe
+
+@app.get("/recipes/")
+async def get_recipes(db: Session = Depends(get_db)):
+    return db.query(Recipe).all()
+
+Mukul Vhai, [21-Dec-24 8:48 PM]
+# Chatbot integration
+class RecipeChatbot:
+    def __init__(self):
+        pass
+        
+    async def get_recipe_recommendation(self, user_query: str, available_ingredients: List[str], db: Session) -> str:
+        recipes = db.query(Recipe).all()
+        
+        filtered_recipes = []
+        for recipe in recipes:
+            required_ingredients = set(recipe.ingredients)
+            available = set(available_ingredients)
+            if required_ingredients.issubset(available):
+                filtered_recipes.append({
+                    "name": recipe.name,
+                    "ingredients": recipe.ingredients,
+                    "cuisine_type": recipe.cuisine_type,
+                    "preparation_time": recipe.preparation_time,
+                    "taste_profile": recipe.taste_profile
+                })
+        
+        if not filtered_recipes:
+            return "Sorry, I couldn't find any recipes matching your available ingredients."
+        
+        context = f"""
+        User preference: {user_query}
+        Available recipes: {json.dumps(filtered_recipes, indent=2)}
+        Task: Recommend the best matching recipes based on the user's preference and explain why.
+        """
+        
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful cooking assistant that recommends recipes based on available ingredients and user preferences."},
+                {"role": "user", "content": context}
+            ]
+        )
+        
+        return response.choices[0].message.content
+
+# Initialize chatbot
+chatbot = RecipeChatbot()
+
+@app.post("/chat/")
+async def chat_recommendation(query: str, db: Session = Depends(get_db)):
+    ingredients = db.query(Ingredient).all()
+    available_ingredients = [ing.name for ing in ingredients]
+    recommendation = await chatbot.get_recipe_recommendation(query, available_ingredients, db)
+    return {"recommendation": recommendation}
+
+# Run the application
+print("Starting the server...")
+ngrok_tunnel = ngrok.connect(8000)
+print('Public URL:', ngrok_tunnel.public_url)
+uvicorn.run(app, port=8000)
+
+# Create a new cell for testing the API
+"""
+import requests
+import json
+
+# Replace with the ngrok URL from above
+BASE_URL = "https://5c71-34-80-45-139.ngrok-free.app"  # Get this from the output above
+
+# Test creating an ingredient
+ingredient_data = {
+    "name": "tomato",
+    "quantity": 5,
+    "unit": "pieces",
+    "category": "vegetables",
+    "expiry_date": "2024-12-25T00:00:00"
+}
+
+response = requests.post(f"{BASE_URL}/ingredients/", json=ingredient_data)
+print("Created ingredient:", response.json())
+
+# Test creating a recipe
+recipe_data = {
+    "name": "Pasta Pomodoro",
+    "ingredients": ["pasta", "tomato", "garlic", "basil"],
+    "instructions": "1. Cook pasta\n2. Make sauce\n3. Combine",
+    "cuisine_type": "Italian",
+    "preparation_time": 30,
+    "taste_profile": {"spicy": 1, "savory": 4, "aromatic": 3},
+    "reviews": 4.5,
+    "source": "personal"
+}
+
+response = requests.post(f"{BASE_URL}/recipes/", json=recipe_data)
+print("Created recipe:", response.json())
+
+# Test chatbot
+query = "I want something Italian that's quick to prepare"
+response = requests.post(f"{BASE_URL}/chat/", params={"query": query})
+print("Chatbot response:", response.json())
